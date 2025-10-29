@@ -12,6 +12,8 @@ __pycache__/
 
 /.vs
 
+/translation_utils/*.pdb
+
 /translation_utils/PreProcessing/*
 !/translation_utils/PreProcessing/PreProcessing.sln
 !/translation_utils/PreProcessing/PreProcessing
@@ -44,3 +46,12 @@ __pycache__/
 !/translation_utils/TranslatorGUI/翻译工具/MainWindow.xaml.cs
 !/translation_utils/TranslatorGUI/翻译工具/翻译工具.csproj
 !/translation_utils/TranslatorGUI/翻译工具/翻译工具.csproj.user
+!/translation_utils/TranslatorGUI/翻译工具/MainWindow.ButtonHandlers.cs
+!/translation_utils/TranslatorGUI/翻译工具/Models
+!/translation_utils/TranslatorGUI/翻译工具/Models/*
+!/translation_utils/TranslatorGUI/翻译工具/Converters
+!/translation_utils/TranslatorGUI/翻译工具/Converters/*
+!/translation_utils/TranslatorGUI/翻译工具/TranslationSystem
+!/translation_utils/TranslatorGUI/翻译工具/TranslationSystem/*
+!/translation_utils/TranslatorGUI/翻译工具/Views
+!/translation_utils/TranslatorGUI/翻译工具/Views/*

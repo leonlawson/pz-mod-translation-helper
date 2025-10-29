@@ -1,14 +1,23 @@
 ﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows; // 用于 RoutedEventArgs
-using System.Security.Cryptography;
-using System.Collections.Concurrent;
-using System.Windows.Threading;
+using System.Windows.Data;
 using System.Windows.Media;
+using System.Windows.Threading;
+using TranslationSystem; // 引入语言枚举与工具
+using 翻译工具.Models; // 引入拆分后的模型
+using 翻译工具.Views; // 引入拆分后的视图窗口
 
 namespace 翻译工具
 {
@@ -27,6 +36,18 @@ namespace 翻译工具
         private readonly StringBuilder _pendingWhileSelecting = new StringBuilder();
         private readonly DispatcherTimer _outputTimer;
 
+        // 新增：用于任务列表的数据源
+        private readonly ObservableCollection<ModItemView> _modItems = new();
+
+        // 新增：标记 CLI 操作是否进行中
+        private bool _isRunning = false;
+
+        // 新增：进度窗口实例
+        private ProgressWindow? _progressWindow = null;
+
+        // 新增：当前用户的 PR 状态（用于按钮显示和启用逻辑）
+        private string _currentUserPRState = string.Empty;
+
         // MainWindow 构造函数
         public MainWindow()
         {
@@ -35,6 +56,9 @@ namespace 翻译工具
 
             InitializeComponent();
             LoadConfig();
+
+            // 绑定列表数据源
+            try { dgMods.ItemsSource = _modItems; } catch { }
 
             // 主窗口默认从屏幕中心启动
             this.WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen;
@@ -68,13 +92,16 @@ namespace 翻译工具
                 AppendOutput($"PAT 加解密失败: {ex.Message}");
             }
 
-            // 在主窗口中显示当前翻译文件路径（用户以前选择的或默认路径）
+            // 在主窗口中显示当前翻译文件路径和语言（用户以前选择的或默认）
             try
             {
                 var displayPath = string.IsNullOrWhiteSpace(_config.LocalPath)
                     ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
                     : _config.LocalPath;
                 if (txtPath != null) txtPath.Text = displayPath;
+
+                // 显示当前语言
+                UpdateLanguageDisplay();
             }
             catch { }
 
@@ -104,7 +131,8 @@ namespace 翻译工具
                 {
                     _config = new Config
                     {
-                        LocalPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                        LocalPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                        LanguageSuffix = "CN"
                     };
                 }
             }
@@ -112,7 +140,8 @@ namespace 翻译工具
             {
                 _config = new Config
                 {
-                    LocalPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                    LocalPath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    LanguageSuffix = "CN"
                 };
             }
         }
@@ -142,8 +171,8 @@ namespace 翻译工具
             var dlg = new System.Windows.Window
             {
                 Title = "确认用户信息",
-                Width = 400,
-                Height = 200,
+                Width = 550,
+                Height = 360,
                 WindowStartupLocation = System.Windows.WindowStartupLocation.CenterOwner,
                 ResizeMode = System.Windows.ResizeMode.NoResize,
                 Owner = this,
@@ -160,16 +189,74 @@ namespace 翻译工具
             var txtEmail = new System.Windows.Controls.TextBox { Text = _config.UserEmail ?? string.Empty, Margin = new System.Windows.Thickness(0, 4, 0, 8) };
             panel.Children.Add(txtEmail);
 
-            var btnPanel = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+            // 翻译文件路径选择
+            panel.Children.Add(new System.Windows.Controls.TextBlock { Text = "翻译文件路径:", Margin = new System.Windows.Thickness(0, 4, 0, 4) });
+            var pathPanel = new System.Windows.Controls.DockPanel { Margin = new System.Windows.Thickness(0, 0, 0, 8) };
+            var btnBrowsePath = new System.Windows.Controls.Button { Content = "浏览", Width = 60, Margin = new System.Windows.Thickness(6, 0, 0, 0) };
+            System.Windows.Controls.DockPanel.SetDock(btnBrowsePath, System.Windows.Controls.Dock.Right);
+            var txtPath = new System.Windows.Controls.TextBox
+            {
+                Text = _config.LocalPath ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                IsReadOnly = true
+            };
+            pathPanel.Children.Add(btnBrowsePath);
+            pathPanel.Children.Add(txtPath);
+            panel.Children.Add(pathPanel);
+
+            // 文件夹浏览逻辑
+            btnBrowsePath.Click += (s, e) =>
+            {
+                using var fbd = new System.Windows.Forms.FolderBrowserDialog();
+                fbd.Description = "选择翻译文件存储路径";
+                fbd.SelectedPath = txtPath.Text;
+                var res = fbd.ShowDialog();
+                if (res == System.Windows.Forms.DialogResult.OK)
+                {
+                    txtPath.Text = fbd.SelectedPath;
+                }
+            };
+
+            // 新增：语言选择
+            panel.Children.Add(new System.Windows.Controls.TextBlock { Text = "翻译语言:" });
+            var cbLang = new System.Windows.Controls.ComboBox { Margin = new System.Windows.Thickness(0, 4, 0, 8) };
+            // 仅显示简体中文（CN），临时隐藏其他语言
+            foreach (var lang in LanguageHelper.All)
+            {
+                var suffix = lang.ToSuffix();
+                if (!string.Equals(suffix, "CN", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var item = new System.Windows.Controls.ComboBoxItem
+                {
+                    Content = $"{lang} ({suffix})",
+                    Tag = suffix
+                };
+                cbLang.Items.Add(item);
+            }
+            // 选择当前配置语言（默认 CN）
+            string currentSuffix = string.IsNullOrWhiteSpace(_config.LanguageSuffix) ? "CN" : _config.LanguageSuffix!;
+            cbLang.SelectedIndex = 0;
+            for (int i = 0; i < cbLang.Items.Count; i++)
+            {
+                if (cbLang.Items[i] is System.Windows.Controls.ComboBoxItem cbi && string.Equals(cbi.Tag?.ToString(), currentSuffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    cbLang.SelectedIndex = i;
+                    break;
+                }
+            }
+            panel.Children.Add(cbLang);
+
+            var btnPanel = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right, Margin = new System.Windows.Thickness(0, 12, 0, 0) };
             var btnOk = new System.Windows.Controls.Button { Content = "确认", Width = 80, Margin = new System.Windows.Thickness(4) };
             btnPanel.Children.Add(btnOk);
             panel.Children.Add(btnPanel);
 
             // 验证用户名：仅允许字母、数字和下划线；验证邮箱：使用 MailAddress 简单验证
-            btnOk.Click += (s, e) =>
+            btnOk.Click += async (s, e) =>
             {
                 var name = txtName.Text?.Trim() ?? string.Empty;
                 var email = txtEmail.Text?.Trim() ?? string.Empty;
+                var path = txtPath.Text?.Trim() ?? string.Empty;
 
                 if (string.IsNullOrEmpty(name) || !System.Text.RegularExpressions.Regex.IsMatch(name, "^[A-Za-z0-9_]+$"))
                 {
@@ -187,222 +274,387 @@ namespace 翻译工具
                     return;
                 }
 
+                if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+                {
+                    System.Windows.MessageBox.Show(dlg, "请选择有效的文件夹路径。", "无效路径", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+                    return;
+                }
+
+                string selectedSuffix = "CN";
+                if (cbLang.SelectedItem is System.Windows.Controls.ComboBoxItem sel && sel.Tag is string tagStr && !string.IsNullOrWhiteSpace(tagStr))
+                {
+                    selectedSuffix = tagStr;
+                }
+
                 _config.UserName = name;
                 _config.UserEmail = email;
+                _config.LocalPath = path;
+                _config.LanguageSuffix = selectedSuffix;
                 SaveConfig(); // 立即存储
+
+                // 更新主界面路径和语言显示
+                if (txtPath != null) this.txtPath.Text = path;
+                UpdateLanguageDisplay();
 
                 dlg.DialogResult = true;
                 dlg.Close();
+
+                // 关闭对话框后，自动执行初始化流程
+                ClearOutput();
+                AppendOutput("════════════════════════════════════════");
+                AppendOutput("正在初始化翻译任务列表...");
+                AppendOutput("════════════════════════════════════════");
+                await RunHelperAsync("init", null);
+                await RunHelperAsync("sync", null);
+                await RunHelperAsync("listpr", null);
+                await LoadTranslationInfoAsync();
+                AppendOutput("\n════════════════════════════════════════");
+                AppendOutput("✓ 初始化完成！");
+                AppendOutput("════════════════════════════════════════");
+            };
+
+            // 处理对话框关闭事件：如果用户点击关闭按钮（X 按钮）或取消，则退出程序
+            dlg.Closing += (s, e) =>
+            {
+                // 如果对话框没有设置 DialogResult 为 true，说明用户点击了关闭按钮而非"确认"按钮
+                if (dlg.DialogResult != true)
+                {
+                    // 关闭主窗口，退出程序
+                    this.Close();
+                }
             };
 
             dlg.Content = panel;
             dlg.ShowDialog();
         }
 
-        private void btnBrowse_Click(object sender, System.Windows.RoutedEventArgs e)
+        private async Task LoadTranslationInfoAsync()
         {
-            using var fbd = new System.Windows.Forms.FolderBrowserDialog();
-            fbd.Description = "选择翻译文件存储路径";
-            fbd.SelectedPath = string.IsNullOrWhiteSpace(_config.LocalPath) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : _config.LocalPath;
-            var res = fbd.ShowDialog();
-            if (res == System.Windows.Forms.DialogResult.OK)
+            try
             {
-                _config.LocalPath = fbd.SelectedPath;
-                txtPath.Text = _config.LocalPath;
-                SaveConfig();
+                var suffix = string.IsNullOrWhiteSpace(_config.LanguageSuffix) ? "CN" : _config.LanguageSuffix!;
+                var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                var jsonPath = Path.Combine(baseDir, "bin", $"translation_info_{suffix}.json");
+
+                if (!File.Exists(jsonPath))
+                {
+                    AppendOutput($"未找到统计文件: {jsonPath}");
+                    return;
+                }
+
+                var json = await File.ReadAllTextAsync(jsonPath, Encoding.UTF8);
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                };
+                var info = JsonSerializer.Deserialize<TranslationInfoFile>(json, options);
+                if (info?.Translations == null)
+                {
+                    AppendOutput("统计文件格式无效或为空。");
+                    return;
+                }
+
+                _modItems.Clear();
+                foreach (var t in info.Translations)
+                {
+                    _modItems.Add(new ModItemView(t, _config.UserName ?? string.Empty));
+                }
+
+                // 默认按 ModId 升序排序
+                ApplyDefaultSort();
+
+                AppendOutput($"已加载 { _modItems.Count } 个 Mod 状态。");
+
+                // 新增：更新按钮状态
+                UpdateButtonStates();
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"读取统计文件失败: {ex.Message}");
             }
         }
 
-        private async void btnInit_Click(object sender, System.Windows.RoutedEventArgs e)
+        private void ApplyDefaultSort()
         {
-            await RunHelperAsync("init", null);
-        }
-
-        private async void btnSync_Click(object sender, System.Windows.RoutedEventArgs e)
-        {
-            await RunHelperAsync("sync", null);
-        }
-
-        private void btnStart_Click(object sender, System.Windows.RoutedEventArgs e)
-        {
-            var basePath = string.IsNullOrWhiteSpace(txtPath.Text) ? _config.LocalPath : txtPath.Text.Trim();
-            if (string.IsNullOrWhiteSpace(basePath)) basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-            _config.LocalPath = basePath;
-            SaveConfig();
-
-            var file = Path.Combine(basePath, "pz-mod-translation-helper", "data", "translations_CN.txt");
-            var guideImage = Path.Combine(basePath, "pz-mod-translation-helper", "简体中文翻译格式说明.png");
-
-            if (File.Exists(file))
+            try
             {
-                try
+                var view = CollectionViewSource.GetDefaultView(dgMods.ItemsSource);
+                if (view == null) return;
+                view.SortDescriptions.Clear();
+                view.SortDescriptions.Add(new SortDescription(nameof(ModItemView.ModId), ListSortDirection.Ascending));
+                view.Refresh();
+            }
+            catch { }
+        }
+
+        // 使用VS Code打开文件（优先 VS Code，不可用时回退系统默认程序）
+        private void OpenFilesWithVSCode(string translationFile, string guideImage)
+        {
+            try
+            {
+                var files = new List<string> { translationFile };
+                if (File.Exists(guideImage)) files.Add(guideImage);
+
+                bool vsCodeSuccess = TryLaunchVSCode(files);
+
+                // 如果 VS Code 启动失败，回退到默认程序
+                if (!vsCodeSuccess)
                 {
-                    // 优先尝试使用 VS Code 打开（使用系统 PATH 中的 `code` 命令）
+                    AppendOutput($"尝试使用系统默认程序打开...");
+
                     try
                     {
-                        // If guide image exists, open both files in VS Code; otherwise open only the translations file
-                        var args = File.Exists(guideImage)
-                            ? $"{EscapeArg(file)} {EscapeArg(guideImage)}"
-                            : EscapeArg(file);
-
-                        var codePsi = new ProcessStartInfo("code", args)
+                        var psi = new ProcessStartInfo(translationFile)
                         {
                             UseShellExecute = true
                         };
-                        Process.Start(codePsi);
-                        AppendOutput($"已使用 VS Code 打开: {file}" + (File.Exists(guideImage) ? $" 和 {guideImage}" : string.Empty));
+                        Process.Start(psi);
+                        AppendOutput($"✓ 已使用默认程序打开翻译文件");
                     }
-                    catch (Exception exCode)
+                    catch (Exception exDefault)
                     {
-                        // 如果无法通过 code 打开（未安装或不在 PATH），回退到默认打开方式
+                        AppendOutput($"✗ 使用默认程序打开失败: {exDefault.Message}");
+                    }
+
+                    if (File.Exists(guideImage))
+                    {
                         try
                         {
-                            var psi = new ProcessStartInfo(file)
-                            {
-                                UseShellExecute = true
-                            };
-                            Process.Start(psi);
-                            AppendOutput($"已打开: {file}");
-
-                            if (File.Exists(guideImage))
-                            {
-                                try
-                                {
-                                    var psi2 = new ProcessStartInfo(guideImage) { UseShellExecute = true };
-                                    Process.Start(psi2);
-                                    AppendOutput($"已打开: {guideImage}");
-                                }
-                                catch (Exception exImg)
-                                {
-                                    AppendOutput($"打开说明图片失败: {exImg.Message}");
-                                }
-                            }
+                            var psi2 = new ProcessStartInfo(guideImage) { UseShellExecute = true };
+                            Process.Start(psi2);
+                            AppendOutput($"✓ 已使用默认程序打开格式说明图片");
                         }
-                        catch (Exception exDefault)
+                        catch (Exception exImg)
                         {
-                            AppendOutput($"打开文件失败 (VSCode:{exCode.Message}; 默认:{exDefault.Message})");
+                            AppendOutput($"! 打开格式说明图片失败: {exImg.Message}");
                         }
                     }
-                }
-                catch (Exception ex)
-                {
-                    AppendOutput($"打开文件失败: {ex.Message}");
                 }
             }
-            else
+            catch (Exception ex)
             {
-                AppendOutput($"文件不存在: {file}");
-                if (File.Exists(guideImage))
-                {
-                    try
-                    {
-                        var psi2 = new ProcessStartInfo(guideImage) { UseShellExecute = true };
-                        Process.Start(psi2);
-                        AppendOutput($"已打开: {guideImage}");
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendOutput($"打开说明图片失败: {ex.Message}");
-                    }
-                }
+                AppendOutput($"✗ 打开文件失败: {ex.Message}");
             }
         }
 
-        private async void btnCommit_Click(object sender, System.Windows.RoutedEventArgs e)
+        // 强化：优先寻找 VS Code 可执行文件进行启动；若不存在再尝试 PATH 中的 code
+        private bool TryLaunchVSCode(IEnumerable<string> files)
         {
-            var input = new InputBox("请输入提交说明:");
-            if (input.ShowDialog() == true)
+            string args = string.Join(" ", files.Select(EscapeArg));
+
+            // 常见安装位置（User、x64、x86、Insiders）
+            var candidates = new List<string>();
+            var localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrWhiteSpace(localApp))
             {
-                var message = input.Value ?? string.Empty;
-                await RunHelperAsync("commit", message);
+                candidates.Add(Path.Combine(localApp, "Programs", "Microsoft VS Code", "Code.exe"));
+                candidates.Add(Path.Combine(localApp, "Programs", "Microsoft VS Code Insiders", "Code - Insiders.exe"));
             }
-            else
+            candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft VS Code", "Code.exe"));
+            var pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            if (!string.IsNullOrWhiteSpace(pf86))
             {
-                AppendOutput("已取消提交。");
+                candidates.Add(Path.Combine(pf86, "Microsoft VS Code", "Code.exe"));
             }
+
+            foreach (var exe in candidates.Distinct().Where(File.Exists))
+            {
+                if (StartVSCodeProcess(exe, args))
+                {
+                    AppendOutput($"✓ 已使用 VS Code 打开翻译文件");
+                    if (files.Count() > 1) AppendOutput($"✓ 已使用 VS Code 打开格式说明图片");
+                    return true;
+                }
+            }
+
+            // 回退到 PATH 中的 code 命令
+            if (StartVSCodeProcess("code", args))
+            {
+                AppendOutput($"✓ 已使用 VS Code 打开翻译文件");
+                if (files.Count() > 1) AppendOutput($"✓ 已使用 VS Code 打开格式说明图片");
+                return true;
+            }
+
+            AppendOutput("! 未检测到 VS Code 或启动失败");
+            return false;
+        }
+
+        private bool StartVSCodeProcess(string fileName, string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = fileName,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true
+                };
+
+                using var process = Process.Start(psi);
+                if (process != null)
+                {
+                    if (!process.WaitForExit(2000))
+                    {
+                        return true; // 仍在运行，视为成功
+                    }
+                    else if (process.ExitCode == 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"! 无法使用 VS Code: {ex.Message}");
+            }
+            return false;
         }
 
         private async Task RunHelperAsync(string operation, string? commitMessage)
         {
-            var basePath = string.IsNullOrWhiteSpace(txtPath.Text) ? _config.LocalPath : txtPath.Text.Trim();
-            if (string.IsNullOrWhiteSpace(basePath)) basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-            _config.LocalPath = basePath;
-            SaveConfig();
-
-            // Ensure we pass the repository root folder to the helper (basePath/pz-mod-translation-helper)
-            var repoRoot = Path.Combine(basePath, "pz-mod-translation-helper");
-
-            var exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin", "TranslatorHelper.exe");
-            if (!File.Exists(exePath))
+            // 禁用按钮，防止并发操作
+            if (_isRunning)
             {
-                AppendOutput($"无法找到 TranslatorHelper.exe: {exePath}");
+                AppendOutput("已有 CLI 操作进行中，请等待完成。");
                 return;
             }
 
-            var argsBuilder = new StringBuilder();
-            argsBuilder.Append(EscapeArg(RepoUrl));
-            argsBuilder.Append(' ').Append(EscapeArg(PatToken));
-            argsBuilder.Append(' ').Append(EscapeArg(_config.UserName ?? string.Empty));
-            argsBuilder.Append(' ').Append(EscapeArg(_config.UserEmail ?? string.Empty));
-            argsBuilder.Append(' ').Append(EscapeArg(operation));
-            if (operation == "commit")
-            {
-                argsBuilder.Append(' ').Append(EscapeArg(commitMessage ?? string.Empty));
-            }
-            // pass repository root path as last argument
-            argsBuilder.Append(' ').Append(EscapeArg(repoRoot));
+            _isRunning = true;
+            DisableAllButtons();
 
-            // Determine encoding for child process output. Prefer GBK (code page 936) on Chinese Windows,
-            // fall back to Encoding.Default if unavailable.
-            Encoding childEncoding;
-            try
-            {
-                childEncoding = Encoding.GetEncoding(936);
-            }
-            catch
-            {
-                childEncoding = Encoding.Default;
-            }
-
-            var psi = new ProcessStartInfo(exePath, argsBuilder.ToString())
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                StandardOutputEncoding = childEncoding,
-                StandardErrorEncoding = childEncoding
-            };
-
-            AppendOutput($"运行: {exePath} {argsBuilder}");
+            // 显示进度窗口
+            _progressWindow = new ProgressWindow(this);
+            _progressWindow.Show();
 
             try
             {
-                using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+                var basePath = string.IsNullOrWhiteSpace(txtPath.Text) ? _config.LocalPath : txtPath.Text.Trim();
+                if (string.IsNullOrWhiteSpace(basePath)) basePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
-                proc.OutputDataReceived += (s, e) =>
+                _config.LocalPath = basePath;
+                SaveConfig();
+
+                // Ensure we pass the repository root folder to the helper (basePath/pz-mod-translation-helper)
+                var repoRoot = Path.Combine(basePath, "pz-mod-translation-helper");
+
+                var exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin", "TranslatorHelper.exe");
+                if (!File.Exists(exePath))
                 {
-                    if (e.Data != null) AppendOutput(e.Data);
-                };
-                proc.ErrorDataReceived += (s, e) =>
+                    AppendOutput($"无法找到 TranslatorHelper.exe: {exePath}");
+                    return;
+                }
+
+                var argsBuilder = new StringBuilder();
+                argsBuilder.Append(EscapeArg(RepoUrl));
+                argsBuilder.Append(' ').Append(EscapeArg(PatToken));
+                argsBuilder.Append(' ').Append(EscapeArg(_config.UserName ?? string.Empty));
+                argsBuilder.Append(' ').Append(EscapeArg(_config.UserEmail ?? string.Empty));
+                // 语言后缀，来自配置，默认简体中文 CN
+                var langSuffix = string.IsNullOrWhiteSpace(_config.LanguageSuffix) ? "CN" : _config.LanguageSuffix!;
+                argsBuilder.Append(' ').Append(EscapeArg(langSuffix));
+                // 操作
+                argsBuilder.Append(' ').Append(EscapeArg(operation));
+                // 始终附带占位的提交说明，便于传递本地路径
+                var commitArg = commitMessage ?? string.Empty;
+                argsBuilder.Append(' ').Append(EscapeArg(commitArg));
+                // 传递仓库根目录作为最后一个参数（本地路径）
+                argsBuilder.Append(' ').Append(EscapeArg(repoRoot));
+
+                // Determine encoding for child process output. Prefer GBK (code page 936) on Chinese Windows,
+                // fall back to Encoding.Default if unavailable.
+                Encoding childEncoding;
+                try
                 {
-                    if (e.Data != null) AppendOutput(e.Data);
+                    childEncoding = Encoding.GetEncoding(936);
+                }
+                catch
+                {
+                    childEncoding = Encoding.Default;
+                }
+
+                var psi = new ProcessStartInfo(exePath, argsBuilder.ToString())
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = childEncoding,
+                    StandardErrorEncoding = childEncoding
                 };
 
-                proc.Start();
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
+                // 构建用于日志输出的脱敏参数字符串
+                var maskedToken = MaskPatToken(PatToken);
+                var maskedArgsBuilder = new StringBuilder();
+                maskedArgsBuilder.Append(EscapeArg(RepoUrl));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(maskedToken));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(_config.UserName ?? string.Empty));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(_config.UserEmail ?? string.Empty));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(langSuffix));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(operation));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(commitArg));
+                maskedArgsBuilder.Append(' ').Append(EscapeArg(repoRoot));
 
-                await Task.Run(() => proc.WaitForExit());
+                AppendOutput($"运行: {exePath} {maskedArgsBuilder}");
 
-                //AppendOutput($"进程退出，代码: {proc.ExitCode}");
+                try
+                {
+                    using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+
+                    proc.OutputDataReceived += (s, e) =>
+                    {
+                        if (e.Data != null) AppendOutput(e.Data);
+                    };
+                    proc.ErrorDataReceived += (s, e) =>
+                    {
+                        if (e.Data != null) AppendOutput(e.Data);
+                    };
+
+                    proc.Start();
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    await Task.Run(() => proc.WaitForExit());
+
+                    //AppendOutput($"进程退出，代码: {proc.ExitCode}");
+                }
+                catch (Exception ex)
+                {
+                    AppendOutput($"执行失败: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                AppendOutput($"执行失败: {ex.Message}");
+                // 关闭并销毁进度窗口
+                try
+                {
+                    if (_progressWindow != null)
+                    {
+                        _progressWindow.Close();
+                        _progressWindow = null;
+                    }
+                }
+                catch { }
+
+                // 确保无论如何都启用按钮
+                _isRunning = false;
+                EnableAllButtons();
             }
+        }
+
+        // 新增：将PAT token脱敏，只显示前缀和后10位
+        private static string MaskPatToken(string token)
+        {
+            if (string.IsNullOrEmpty(token))
+                return "\"\"";
+            
+            if (token.Length <= 10)
+                return "github_pat_***";
+            
+            string lastTen = token.Substring(token.Length - 10);
+            return $"github_pat_***{lastTen}";
         }
 
         private static string EscapeArg(string s)
@@ -425,6 +677,21 @@ namespace 翻译工具
                 // try to dequeue some items
                 for (int i = 0; i < 1000 && _outputQueue.TryDequeue(out _); i++) { }
             }
+        }
+
+        // 新增：清空日志输出与缓冲
+        private void ClearOutput()
+        {
+            try
+            {
+                // 清空 UI
+                txtOutput.Clear();
+                // 清空选择期间缓冲
+                _pendingWhileSelecting.Clear();
+                // 清空队列
+                while (_outputQueue.TryDequeue(out _)) { }
+            }
+            catch { }
         }
 
         private void OutputTimer_Tick(object? sender, EventArgs e)
@@ -487,43 +754,181 @@ namespace 翻译工具
             }
         }
 
-        private class Config
+        private void UpdateLanguageDisplay()
         {
-            public string? UserName { get; set; }
-            public string? UserEmail { get; set; }
-            public string? LocalPath { get; set; }
+            try
+            {
+                if (txtLanguage == null) return;
+                var suffix = string.IsNullOrWhiteSpace(_config.LanguageSuffix) ? "CN" : _config.LanguageSuffix!;
+                // 反向解析枚举名（若不可用则仅显示后缀）
+                var lang = LanguageHelper.FromSuffix(suffix);
+                txtLanguage.Text = $"{lang} ({suffix})";
+            }
+            catch { }
         }
 
-        // Simple input box window for commit message
-        private class InputBox : System.Windows.Window
+        /// <summary>
+        /// 禁用所有主要操作按钮，防止在 CLI 执行期间进行其他操作。
+        /// </summary>
+        private void DisableAllButtons()
         {
-            public string? Value { get; private set; }
-
-            public InputBox(string prompt)
+            try
             {
-                Title = "输入";
-                Width = 400;
-                Height = 180;
-                WindowStartupLocation = System.Windows.WindowStartupLocation.CenterOwner;
-                ResizeMode = System.Windows.ResizeMode.NoResize;
-
-                var panel = new System.Windows.Controls.StackPanel { Margin = new System.Windows.Thickness(10) };
-                panel.Children.Add(new System.Windows.Controls.TextBlock { Text = prompt });
-                var txt = new System.Windows.Controls.TextBox { Height = 60, AcceptsReturn = true, TextWrapping = System.Windows.TextWrapping.Wrap, Margin = new System.Windows.Thickness(0, 6, 0, 6) };
-                panel.Children.Add(txt);
-
-                var btnPanel = new System.Windows.Controls.StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
-                var ok = new System.Windows.Controls.Button { Content = "确定", Width = 80, Margin = new System.Windows.Thickness(4) };
-                var cancel = new System.Windows.Controls.Button { Content = "取消", Width = 80, Margin = new System.Windows.Thickness(4) };
-                btnPanel.Children.Add(ok);
-                btnPanel.Children.Add(cancel);
-                panel.Children.Add(btnPanel);
-
-                ok.Click += (s, e) => { Value = txt.Text; DialogResult = true; Close(); };
-                cancel.Click += (s, e) => { DialogResult = false; Close(); };
-
-                Content = panel;
+                btnStart.IsEnabled = false;
+                btnCommit.IsEnabled = false;
+                btnConfirmLock.IsEnabled = false;
+                btnSubmitReview.IsEnabled = false;
+                txtPath.IsEnabled = false;
+                dgMods.IsEnabled = false; // 禁用列表操作
             }
+            catch { }
+        }
+
+        /// <summary>
+        /// 启用所有主要操作按钮。
+        /// </summary>
+        private void EnableAllButtons()
+        {
+            try
+            {
+                // 不再直接启用所有按钮，而是根据当前 PR 状态智能更新
+                UpdateButtonStates();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 更新按钮状态：根据当前用户的 PR 状态决定按钮显示和启用状态。
+        /// </summary>
+        private void UpdateButtonStates()
+        {
+            try
+            {
+                // 查找当前用户锁定的 Mod
+                var myLockedMod = _modItems.FirstOrDefault(m => m.IsLockedByMe);
+                
+                // 检查是否有勾选的项
+                var hasSelectedItems = _modItems.Any(m => m.IsSelected && !m.IsLocked);
+                
+                if (myLockedMod == null)
+                {
+                    // 没有锁定的任务（不存在自身的开放PR）
+                    btnStart.IsEnabled = false; // 禁用开始翻译
+                    btnCommit.IsEnabled = false; // 禁用保存进度
+                    btnConfirmLock.IsEnabled = true;
+                    btnSubmitReview.IsEnabled = false; // 禁用提交审核
+                    btnSubmitReview.Visibility = System.Windows.Visibility.Collapsed;
+                    dgMods.IsEnabled = true; // 启用列表
+                    SetCheckBoxesEnabled(true); // 启用复选框
+                    _currentUserPRState = string.Empty;
+                    
+                    // 动态修改刷新按钮文本
+                    if (hasSelectedItems)
+                    {
+                        btnConfirmLock.Content = "领取任务";
+                    }
+                    else
+                    {
+                        btnConfirmLock.Content = "刷新任务";
+                    }
+                    return;
+                }
+
+                // 获取当前用户的 PR 状态
+                _currentUserPRState = myLockedMod.PRReviewState ?? string.Empty;
+                var normalizedState = NormalizePrState(_currentUserPRState);
+
+                if (normalizedState == "draft" || string.IsNullOrWhiteSpace(normalizedState))
+                {
+                    // Draft 状态：所有按钮可用，显示"提交审核"
+                    btnStart.IsEnabled = true;
+                    btnCommit.IsEnabled = true;
+                    btnConfirmLock.IsEnabled = true;
+                    btnSubmitReview.IsEnabled = true;
+                    btnSubmitReview.Visibility = System.Windows.Visibility.Visible;
+                    btnSubmitReview.Content = "提交审核";
+                    dgMods.IsEnabled = true; // 启用列表
+                    SetCheckBoxesEnabled(true); // 启用复选框
+                    
+                    // 动态修改刷新按钮文本
+                    if (hasSelectedItems)
+                    {
+                        btnConfirmLock.Content = "追加任务";
+                    }
+                    else
+                    {
+                        btnConfirmLock.Content = "刷新任务";
+                    }
+                }
+                else // Ready for Review 或其他状态
+                {
+                    // Ready for Review 状态：只有刷新和撤回修改按钮可用
+                    btnStart.IsEnabled = false;
+                    btnCommit.IsEnabled = false;
+                    btnConfirmLock.IsEnabled = true; // 刷新按钮始终可用
+                    btnSubmitReview.IsEnabled = true;
+                    btnSubmitReview.Visibility = System.Windows.Visibility.Visible;
+                    btnSubmitReview.Content = "撤回修改";
+                    dgMods.IsEnabled = true; // 保持列表可用（可排序、浏览）
+                    SetCheckBoxesEnabled(false); // 仅禁用复选框
+                    
+                    // Ready for Review 状态下，刷新按钮只显示"刷新任务"
+                    btnConfirmLock.Content = "刷新任务";
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"更新按钮状态失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 启用或禁用所有未锁定项的复选框
+        /// </summary>
+        private void SetCheckBoxesEnabled(bool enabled)
+        {
+            try
+            {
+                foreach (var item in _modItems)
+                {
+                    if (!item.IsLocked)
+                    {
+                        item.IsCheckBoxEnabled = enabled;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 当Mod选择状态改变时调用，用于更新按钮状态
+        /// </summary>
+        public void OnModSelectionChanged()
+        {
+            UpdateButtonStates();
+        }
+
+        private static string NormalizePrState(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new StringBuilder();
+            foreach (var ch in s)
+            {
+                if (ch != ' ' && ch != '_' && ch != '-') sb.Append(ch);
+            }
+            return sb.ToString().ToLowerInvariant();
+        }
+
+        // 判断是否为空行或注释行
+        private static bool IsNullOrCommentLine(string line)
+        {
+            return string.IsNullOrWhiteSpace(line) || 
+                   line.TrimStart().StartsWith("//") || 
+                   line.TrimStart().StartsWith("#") || 
+                   line.TrimStart().StartsWith("/*") || 
+                   line.TrimStart().StartsWith("*") || 
+                   line.TrimStart().StartsWith("*/") || 
+                   line.TrimStart().StartsWith("--");
         }
 
         // AES-256-CBC 加密，返回 Base64( IV + ciphertext )
