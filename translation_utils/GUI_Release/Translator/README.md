@@ -9,7 +9,7 @@
 使用 Visual Studio 打开并编译：
 
 ```
-<RepoDIr>/translation_utils/TranslatorGUI/翻译工具.sln
+<RepoDIr>/translation_utils/TranslatorGUI/TranslatorGUI.sln
 ```
 
 编译完成后，会在：
@@ -33,7 +33,7 @@
 确保目录结构中包含如下关键文件与文件夹：
 
 ```
-.../翻译/MinGit/
+.../Translator/MinGit/
  ├─ cmd/
  ├─ mingw64/
  ├─ usr/
@@ -57,7 +57,7 @@ To build a distributable version of the Translator Tool, follow these steps:
 Open and build the solution using Visual Studio:
 
 ```
-<RepoDIr>/translation_utils/TranslatorGUI/翻译工具.sln
+<RepoDIr>/translation_utils/TranslatorGUI/TranslatorGUI.sln
 ```
 
 The resulting binaries will appear in:
@@ -81,7 +81,7 @@ Steps:
 After extraction, ensure the directory contains:
 
 ```
-.../翻译/MinGit/
+.../Translator/MinGit/
  ├─ cmd/
  ├─ mingw64/
  ├─ usr/
